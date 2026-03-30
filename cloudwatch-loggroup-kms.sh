@@ -176,7 +176,7 @@ for lg in "${SELECTED[@]}"; do
 
   if [[ "$CURRENT_KMS" != "None" && -n "$CURRENT_KMS" ]]; then
     echo "⏭️  SKIP (이미 적용됨: ${CURRENT_KMS##*/})"
-    ((SKIP++))
+    ((SKIP++)) || true
     continue
   fi
 
@@ -191,12 +191,12 @@ for lg in "${SELECTED[@]}"; do
 
   if [[ $RC -eq 0 ]]; then
     echo "✅ (${ELAPSED_MS}ms)"
-    ((SUCCESS++))
+    ((SUCCESS++)) || true
   else
     echo "❌ (${ELAPSED_MS}ms)"
     echo "        ↳ 에러: $ERR_MSG"
     FAILED_GROUPS+=("$lg")
-    ((FAIL++))
+    ((FAIL++)) || true
   fi
 done
 
@@ -227,10 +227,10 @@ for lg in "${SELECTED[@]}"; do
 
   if [[ "$KMS_RESULT" != "None" && "$KMS_RESULT" != "조회실패" && -n "$KMS_RESULT" ]]; then
     printf "  ✅ %-55s → %s\n" "$lg" "$KMS_RESULT"
-    ((VERIFY_OK++))
+    ((VERIFY_OK++)) || true
   else
     printf "  ❌ %-55s → %s\n" "$lg" "${KMS_RESULT:-미적용}"
-    ((VERIFY_FAIL++))
+    ((VERIFY_FAIL++)) || true
   fi
 done
 
