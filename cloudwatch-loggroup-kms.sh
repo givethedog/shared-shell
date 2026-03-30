@@ -27,7 +27,7 @@ UNENCRYPTED=()
 while IFS= read -r lg; do
   [[ -n "$lg" ]] && UNENCRYPTED+=("$lg")
 done < <(aws logs describe-log-groups \
-  --query 'logGroups[?!not_null(kmsKeyId)].logGroupName' \
+  --query 'logGroups[?!kmsKeyId].logGroupName' \
   --output text | tr '\t' '\n')
 
 if [[ ${#UNENCRYPTED[@]} -eq 0 ]]; then
@@ -158,40 +158,83 @@ echo ""
 # 4단계: 선택된 로그 그룹에 KMS 적용
 # ─────────────────────────────────────────────────
 echo "[4/4] KMS 키 적용 시작..."
+echo "  대상 KMS ARN: $KMS_KEY_ARN"
 echo ""
 
 SUCCESS=0
 FAIL=0
+SKIP=0
+FAILED_GROUPS=()
 
 for lg in "${SELECTED[@]}"; do
-  printf "  %-60s ... " "$lg"
-  if aws logs associate-kms-key \
+  printf "  [%s] %-55s ... " "$(date '+%H:%M:%S')" "$lg"
+
+  CURRENT_KMS=$(aws logs describe-log-groups \
+    --log-group-name-prefix "$lg" \
+    --query "logGroups[?logGroupName==\`$lg\`].kmsKeyId | [0]" \
+    --output text 2>/dev/null || echo "None")
+
+  if [[ "$CURRENT_KMS" != "None" && -n "$CURRENT_KMS" ]]; then
+    echo "⏭️  SKIP (이미 적용됨: ${CURRENT_KMS##*/})"
+    ((SKIP++))
+    continue
+  fi
+
+  START_TS=$(date +%s%N)
+  ERR_MSG=$(aws logs associate-kms-key \
     --region "$REGION" \
     --log-group-name "$lg" \
-    --kms-key-id "$KMS_KEY_ARN" 2>/dev/null; then
-    echo "✅"
+    --kms-key-id "$KMS_KEY_ARN" 2>&1)
+  RC=$?
+  END_TS=$(date +%s%N)
+  ELAPSED_MS=$(( (END_TS - START_TS) / 1000000 ))
+
+  if [[ $RC -eq 0 ]]; then
+    echo "✅ (${ELAPSED_MS}ms)"
     ((SUCCESS++))
   else
-    echo "❌"
+    echo "❌ (${ELAPSED_MS}ms)"
+    echo "        ↳ 에러: $ERR_MSG"
+    FAILED_GROUPS+=("$lg")
     ((FAIL++))
   fi
 done
 
 echo ""
 echo "=============================================="
-echo " 완료! 성공: ${SUCCESS}개 / 실패: ${FAIL}개"
+echo " 완료! 성공: ${SUCCESS}개 / 스킵: ${SKIP}개 / 실패: ${FAIL}개"
 echo "=============================================="
+
+if [[ ${#FAILED_GROUPS[@]} -gt 0 ]]; then
+  echo ""
+  echo " ⚠️  실패한 로그 그룹:"
+  for fg in "${FAILED_GROUPS[@]}"; do
+    echo "    - $fg"
+  done
+fi
 echo ""
 
-# 결과 확인
 echo "[결과 확인] 적용된 로그 그룹 KMS 현황:"
 echo ""
+VERIFY_OK=0
+VERIFY_FAIL=0
+
 for lg in "${SELECTED[@]}"; do
   KMS_RESULT=$(aws logs describe-log-groups \
     --log-group-name-prefix "$lg" \
-    --query "logGroups[?logGroupName=='$lg'].kmsKeyId | [0]" \
+    --query "logGroups[?logGroupName==\`$lg\`].kmsKeyId | [0]" \
     --output text 2>/dev/null || echo "조회실패")
-  printf "  %-60s → %s\n" "$lg" "$KMS_RESULT"
+
+  if [[ "$KMS_RESULT" != "None" && "$KMS_RESULT" != "조회실패" && -n "$KMS_RESULT" ]]; then
+    printf "  ✅ %-55s → %s\n" "$lg" "$KMS_RESULT"
+    ((VERIFY_OK++))
+  else
+    printf "  ❌ %-55s → %s\n" "$lg" "${KMS_RESULT:-미적용}"
+    ((VERIFY_FAIL++))
+  fi
 done
+
+echo ""
+echo "  검증 결과: KMS 적용 확인 ${VERIFY_OK}개 / 미적용 ${VERIFY_FAIL}개"
 echo ""
 echo "Done."
