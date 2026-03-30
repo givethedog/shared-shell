@@ -23,15 +23,52 @@ echo ""
 # ─────────────────────────────────────────────────
 echo "[1/4] KMS 미적용 로그 그룹 조회 중..."
 
+ALL_GROUPS=()
+ALL_KMS=()
 UNENCRYPTED=()
-while IFS= read -r lg; do
-  [[ -n "$lg" ]] && UNENCRYPTED+=("$lg")
-done < <(aws logs describe-log-groups \
-  --query 'logGroups[?!kmsKeyId].logGroupName' \
-  --output text | tr '\t' '\n')
+NEXT_TOKEN=""
+while true; do
+  PAGINATE_ARGS=()
+  [[ -n "$NEXT_TOKEN" ]] && PAGINATE_ARGS+=(--starting-token "$NEXT_TOKEN")
+
+  RESPONSE=$(aws logs describe-log-groups "${PAGINATE_ARGS[@]}" --output json 2>/dev/null)
+
+  while IFS=$'\t' read -r name kms; do
+    [[ -z "$name" ]] && continue
+    ALL_GROUPS+=("$name")
+    ALL_KMS+=("${kms:-None}")
+    [[ "$kms" == "None" || -z "$kms" ]] && UNENCRYPTED+=("$name")
+  done < <(echo "$RESPONSE" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for lg in data.get('logGroups', []):
+    name = lg['logGroupName']
+    kms = lg.get('kmsKeyId') or 'None'
+    print(f'{name}\t{kms}')
+")
+
+  NEXT_TOKEN=$(echo "$RESPONSE" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('nextToken',''))" 2>/dev/null)
+  [[ -z "$NEXT_TOKEN" ]] && break
+done
+
+echo "  전체 로그 그룹: ${#ALL_GROUPS[@]}개 (KMS 적용: $(( ${#ALL_GROUPS[@]} - ${#UNENCRYPTED[@]} ))개 / 미적용: ${#UNENCRYPTED[@]}개)"
+echo ""
 
 if [[ ${#UNENCRYPTED[@]} -eq 0 ]]; then
-  echo "  ✅ 모든 로그 그룹에 KMS가 적용되어 있습니다. 종료합니다."
+  echo "  ✅ 모든 로그 그룹에 KMS가 적용되어 있습니다."
+  echo ""
+  echo "  ┌──────────────────────────────────────────────────────────────┬──────────────────────────────────┐"
+  printf "  │ %-60s │ %-32s │\n" "Log Group" "KMS Key ID"
+  echo "  ├──────────────────────────────────────────────────────────────┼──────────────────────────────────┤"
+  for i in "${!ALL_GROUPS[@]}"; do
+    KEY_SHORT="${ALL_KMS[$i]}"
+    [[ "$KEY_SHORT" =~ key/(.+)$ ]] && KEY_SHORT="${BASH_REMATCH[1]}"
+    printf "  │ %-60s │ %-32s │\n" "${ALL_GROUPS[$i]}" "$KEY_SHORT"
+  done
+  echo "  └──────────────────────────────────────────────────────────────┴──────────────────────────────────┘"
+  echo ""
   exit 0
 fi
 
@@ -84,19 +121,108 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────
-# 3단계: KMS 키 확인 / 생성
+# 3단계: KMS 키 선택 / 생성
 # ─────────────────────────────────────────────────
-echo "[3/4] KMS 키 확인 중... (Alias: $KMS_ALIAS)"
+echo "[3/4] 사용 가능한 KMS 키 조회 중..."
+echo ""
 
-KMS_KEY_ARN=$(aws kms describe-key --key-id "$KMS_ALIAS" \
-  --query 'KeyMetadata.Arn' --output text 2>/dev/null || true)
+CMK_ARNS=()
+CMK_ALIASES=()
+CMK_DESCS=()
 
-if [[ -n "$KMS_KEY_ARN" && "$KMS_KEY_ARN" != "None" ]]; then
-  echo "  ✅ 기존 KMS 키 발견: $KMS_KEY_ARN"
+while IFS=$'\t' read -r arn ali desc; do
+  [[ -z "$arn" ]] && continue
+  CMK_ARNS+=("$arn")
+  CMK_ALIASES+=("${ali:-(없음)}")
+  CMK_DESCS+=("${desc:-(설명 없음)}")
+done < <(python3 -c "
+import subprocess, json
+
+keys_out = subprocess.run(
+    ['aws', 'kms', 'list-keys', '--output', 'json'],
+    capture_output=True, text=True
+).stdout
+keys = json.loads(keys_out).get('Keys', [])
+
+aliases_out = subprocess.run(
+    ['aws', 'kms', 'list-aliases', '--output', 'json'],
+    capture_output=True, text=True
+).stdout
+alias_map = {}
+for a in json.loads(aliases_out).get('Aliases', []):
+    tid = a.get('TargetKeyId', '')
+    if tid and not a['AliasName'].startswith('alias/aws/'):
+        alias_map[tid] = a['AliasName']
+
+for k in keys:
+    kid = k['KeyId']
+    arn = k['KeyArn']
+    try:
+        desc_out = subprocess.run(
+            ['aws', 'kms', 'describe-key', '--key-id', kid, '--output', 'json'],
+            capture_output=True, text=True
+        ).stdout
+        meta = json.loads(desc_out)['KeyMetadata']
+        if meta['KeyState'] != 'Enabled' or meta['KeyManager'] == 'AWS':
+            continue
+        desc = meta.get('Description', '')
+        alias = alias_map.get(kid, '')
+        print(f'{arn}\t{alias}\t{desc}')
+    except Exception:
+        continue
+" 2>/dev/null)
+
+if [[ ${#CMK_ARNS[@]} -gt 0 ]]; then
+  echo "  기존 고객 관리형 CMK ${#CMK_ARNS[@]}개 발견:"
+  echo ""
+  echo "  ┌─────┬────────────────────────────────────┬──────────────────────────────────────────┐"
+  printf "  │ %3s │ %-34s │ %-40s │\n" "#" "Alias" "Description"
+  echo "  ├─────┼────────────────────────────────────┼──────────────────────────────────────────┤"
+  for i in "${!CMK_ARNS[@]}"; do
+    KEY_SHORT="${CMK_ARNS[$i]}"
+    [[ "$KEY_SHORT" =~ key/(.+)$ ]] && KEY_SHORT="${BASH_REMATCH[1]}"
+    printf "  │ %3d │ %-34s │ %-40s │\n" $((i+1)) "${CMK_ALIASES[$i]}" "${CMK_DESCS[$i]:0:40}"
+  done
+  echo "  └─────┴────────────────────────────────────┴──────────────────────────────────────────┘"
+  echo ""
+  echo "  💡 기존 CMK 사용을 권장합니다 (KMS 키당 월 $1 비용 발생)"
+  echo ""
+  echo "  - 기존 키 선택: 번호 입력 (예: 1)"
+  echo "  - 신규 CMK 생성: n"
+  echo "  - 취소: q"
+  echo ""
+  read -rp "  선택 > " KMS_SELECTION
+
+  if [[ "$KMS_SELECTION" == "q" || "$KMS_SELECTION" == "Q" ]]; then
+    echo "  취소되었습니다."
+    exit 0
+  elif [[ "$KMS_SELECTION" == "n" || "$KMS_SELECTION" == "N" ]]; then
+    KMS_KEY_ARN=""
+  elif [[ "$KMS_SELECTION" =~ ^[0-9]+$ ]] && (( KMS_SELECTION >= 1 && KMS_SELECTION <= ${#CMK_ARNS[@]} )); then
+    KMS_KEY_ARN="${CMK_ARNS[$((KMS_SELECTION-1))]}"
+    echo ""
+    echo "  ✅ 선택된 키: ${CMK_ALIASES[$((KMS_SELECTION-1))]} (${KMS_KEY_ARN##*/})"
+
+    SELECTED_KEY_ID="${KMS_KEY_ARN##*/}"
+    HAS_LOG_PERMISSION=$(aws kms get-key-policy --key-id "$SELECTED_KEY_ID" --policy-name default --output text 2>/dev/null | grep -c "logs\." || true)
+    if [[ "$HAS_LOG_PERMISSION" -eq 0 ]]; then
+      echo ""
+      echo "  ⚠️  이 키에 CloudWatch Logs 서비스 권한이 없을 수 있습니다."
+      echo "     적용 시 실패하면 KMS Key Policy에 logs.${REGION}.amazonaws.com 권한을 추가하세요."
+    fi
+  else
+    echo "  ⚠️  잘못된 입력. 종료합니다."
+    exit 1
+  fi
 else
-  echo "  KMS 키가 존재하지 않습니다. 신규 CMK를 생성합니다..."
+  echo "  기존 고객 관리형 CMK가 없습니다."
+  KMS_KEY_ARN=""
+fi
 
-  # CloudWatch Logs 서비스가 사용할 수 있는 Key Policy
+if [[ -z "$KMS_KEY_ARN" ]]; then
+  echo ""
+  echo "  신규 CMK를 생성합니다... (Alias: $KMS_ALIAS)"
+
   KEY_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
@@ -142,9 +268,12 @@ EOF
     --query 'KeyMetadata.KeyId' \
     --output text)
 
-  aws kms create-alias \
-    --alias-name "$KMS_ALIAS" \
-    --target-key-id "$KMS_KEY_ID"
+  ALIAS_EXISTS=$(aws kms list-aliases --query "Aliases[?AliasName==\`$KMS_ALIAS\`].AliasName | [0]" --output text 2>/dev/null || echo "None")
+  if [[ "$ALIAS_EXISTS" == "None" || -z "$ALIAS_EXISTS" ]]; then
+    aws kms create-alias \
+      --alias-name "$KMS_ALIAS" \
+      --target-key-id "$KMS_KEY_ID"
+  fi
 
   KMS_KEY_ARN=$(aws kms describe-key --key-id "$KMS_KEY_ID" \
     --query 'KeyMetadata.Arn' --output text)
